@@ -37,7 +37,7 @@ import static org.apache.paimon.utils.SerializationUtils.serializeBinaryRow;
 public class DataEvolutionCompactTaskSerializer
         implements VersionedSerializer<DataEvolutionCompactTask> {
 
-    private static final int CURRENT_VERSION = 1;
+    private static final int CURRENT_VERSION = 2;
 
     private final DataFileMetaSerializer dataFileSerializer;
 
@@ -69,7 +69,7 @@ public class DataEvolutionCompactTaskSerializer
     private void serialize(DataEvolutionCompactTask task, DataOutputView view) throws IOException {
         serializeBinaryRow(task.partition(), view);
         dataFileSerializer.serializeList(task.compactBefore(), view);
-        view.writeBoolean(task.isBlobTask());
+        view.writeByte((byte) task.kind().ordinal());
     }
 
     @Override
@@ -106,6 +106,6 @@ public class DataEvolutionCompactTaskSerializer
         return new DataEvolutionCompactTask(
                 deserializeBinaryRow(view),
                 dataFileSerializer.deserializeList(view),
-                view.readBoolean());
+                DataEvolutionCompactTask.TaskKind.values()[view.readByte()]);
     }
 }

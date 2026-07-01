@@ -370,7 +370,9 @@ public class DataEvolutionCompactCoordinator {
             List<DataEvolutionCompactTask> tasks = new ArrayList<>();
             boolean triggerNormalFile = dataFiles.size() >= compactMinFileNum;
             if (triggerNormalFile) {
-                tasks.add(new DataEvolutionCompactTask(partition, dataFiles, false));
+                tasks.add(
+                        new DataEvolutionCompactTask(
+                                partition, dataFiles, DataEvolutionCompactTask.TaskKind.NORMAL));
             }
 
             if (compactBlob) {
@@ -384,7 +386,10 @@ public class DataEvolutionCompactCoordinator {
                     for (List<DataFileMeta> blobFilesToCompact :
                             blobFileGroupsToCompact(blobFiles)) {
                         tasks.add(
-                                new DataEvolutionCompactTask(partition, blobFilesToCompact, true));
+                                new DataEvolutionCompactTask(
+                                        partition,
+                                        blobFilesToCompact,
+                                        DataEvolutionCompactTask.TaskKind.BLOB));
                     }
                 } else {
                     for (DataFileMeta dataFile : dataFiles) {
@@ -394,13 +399,19 @@ public class DataEvolutionCompactCoordinator {
                                                 dataFile, Collections.emptyList()))) {
                             tasks.add(
                                     new DataEvolutionCompactTask(
-                                            partition, blobFilesToCompact, true));
+                                            partition,
+                                            blobFilesToCompact,
+                                            DataEvolutionCompactTask.TaskKind.BLOB));
                         }
                     }
                 }
             }
 
             if (compactVector) {
+                // vector-store compaction requires at least two files, matching blob's implicit
+                // floor (BLOB_COMPACT_MIN_FILE_NUM), regardless of a lower configured
+                // compactMinFileNum.
+                long vectorCompactMinFileNum = Math.max(compactMinFileNum, 2);
                 if (triggerNormalFile) {
                     List<DataFileMeta> vectorStoreFiles = new ArrayList<>();
                     for (DataFileMeta dataFile : dataFiles) {
@@ -408,18 +419,24 @@ public class DataEvolutionCompactCoordinator {
                                 dataFileToVectorStoreFiles.getOrDefault(
                                         dataFile, Collections.emptyList()));
                     }
-                    if (vectorStoreFiles.size() >= compactMinFileNum) {
-                        tasks.add(new DataEvolutionCompactTask(partition, vectorStoreFiles, false));
+                    if (vectorStoreFiles.size() >= vectorCompactMinFileNum) {
+                        tasks.add(
+                                new DataEvolutionCompactTask(
+                                        partition,
+                                        vectorStoreFiles,
+                                        DataEvolutionCompactTask.TaskKind.VECTOR));
                     }
                 } else {
                     for (DataFileMeta dataFile : dataFiles) {
                         List<DataFileMeta> vectorStoreFiles =
                                 dataFileToVectorStoreFiles.getOrDefault(
                                         dataFile, Collections.emptyList());
-                        if (vectorStoreFiles.size() >= compactMinFileNum) {
+                        if (vectorStoreFiles.size() >= vectorCompactMinFileNum) {
                             tasks.add(
                                     new DataEvolutionCompactTask(
-                                            partition, vectorStoreFiles, false));
+                                            partition,
+                                            vectorStoreFiles,
+                                            DataEvolutionCompactTask.TaskKind.VECTOR));
                         }
                     }
                 }

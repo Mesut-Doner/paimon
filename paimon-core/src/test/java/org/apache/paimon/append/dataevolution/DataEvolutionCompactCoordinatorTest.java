@@ -582,7 +582,7 @@ public class DataEvolutionCompactCoordinatorTest {
                         BinaryRow.EMPTY_ROW,
                         Collections.singletonList(
                                 createDataFileMeta("file1.parquet", 0L, 100L, 0, 1024)),
-                        false);
+                        DataEvolutionCompactTask.TaskKind.NORMAL);
 
         assertThatThrownBy(() -> task.doCompact(table, "user"))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -770,7 +770,8 @@ public class DataEvolutionCompactCoordinatorTest {
                         createDataFileMeta("file2.parquet", 100L, 100L, 0, 1024));
 
         DataEvolutionCompactTask task =
-                new DataEvolutionCompactTask(BinaryRow.EMPTY_ROW, files, false);
+                new DataEvolutionCompactTask(
+                        BinaryRow.EMPTY_ROW, files, DataEvolutionCompactTask.TaskKind.NORMAL);
 
         byte[] bytes = serializer.serialize(task);
         DataEvolutionCompactTask deserialized =
@@ -789,7 +790,8 @@ public class DataEvolutionCompactCoordinatorTest {
                         createDataFileMeta("file2.blob", 0L, 100L, 0, 1024));
 
         DataEvolutionCompactTask task =
-                new DataEvolutionCompactTask(BinaryRow.EMPTY_ROW, files, true);
+                new DataEvolutionCompactTask(
+                        BinaryRow.EMPTY_ROW, files, DataEvolutionCompactTask.TaskKind.BLOB);
 
         byte[] bytes = serializer.serialize(task);
         DataEvolutionCompactTask deserialized =
@@ -797,6 +799,27 @@ public class DataEvolutionCompactCoordinatorTest {
 
         assertThat(deserialized).isEqualTo(task);
         assertThat(deserialized.isBlobTask()).isTrue();
+    }
+
+    @Test
+    public void testSerializerVectorTask() throws IOException {
+        DataEvolutionCompactTaskSerializer serializer = new DataEvolutionCompactTaskSerializer();
+
+        List<DataFileMeta> files =
+                Arrays.asList(
+                        createDataFileMeta("file1.vector.json", 0L, 100L, 0, 1024),
+                        createDataFileMeta("file2.vector.json", 0L, 100L, 0, 1024));
+
+        DataEvolutionCompactTask task =
+                new DataEvolutionCompactTask(
+                        BinaryRow.EMPTY_ROW, files, DataEvolutionCompactTask.TaskKind.VECTOR);
+
+        byte[] bytes = serializer.serialize(task);
+        DataEvolutionCompactTask deserialized =
+                serializer.deserialize(serializer.getVersion(), bytes);
+
+        assertThat(deserialized).isEqualTo(task);
+        assertThat(deserialized.isVectorTask()).isTrue();
     }
 
     @Test
@@ -809,7 +832,9 @@ public class DataEvolutionCompactCoordinatorTest {
                         createDataFileMeta("file2.parquet", 100L, 100L, 0, 1024));
 
         BinaryRow partition = BinaryRow.singleColumn(42);
-        DataEvolutionCompactTask task = new DataEvolutionCompactTask(partition, files, false);
+        DataEvolutionCompactTask task =
+                new DataEvolutionCompactTask(
+                        partition, files, DataEvolutionCompactTask.TaskKind.NORMAL);
 
         byte[] bytes = serializer.serialize(task);
         DataEvolutionCompactTask deserialized =

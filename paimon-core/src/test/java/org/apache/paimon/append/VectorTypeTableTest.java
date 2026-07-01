@@ -19,17 +19,27 @@
 package org.apache.paimon.append;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.append.dataevolution.DataEvolutionCompactCoordinator;
+import org.apache.paimon.append.dataevolution.DataEvolutionCompactTask;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.BinaryVector;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.TableTestBase;
+import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.table.sink.StreamTableWrite;
+import org.apache.paimon.table.sink.StreamWriteBuilder;
 import org.apache.paimon.types.DataTypes;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
@@ -57,6 +67,74 @@ public class VectorTypeTableTest extends TableTestBase {
                 });
 
         assertThat(integer.get()).isEqualTo(100);
+    }
+
+    @Test
+    public void testCompactVectorStoreFiles() throws Exception {
+        int vectorLength = testVector.length;
+        Schema.Builder schemaBuilder = Schema.newBuilder();
+        schemaBuilder.column("f0", DataTypes.INT());
+        schemaBuilder.column("f1", DataTypes.STRING());
+        schemaBuilder.column("f2", DataTypes.VECTOR(vectorLength, DataTypes.FLOAT()));
+        schemaBuilder.option(CoreOptions.FILE_FORMAT.key(), "json");
+        schemaBuilder.option(CoreOptions.FILE_COMPRESSION.key(), "none");
+        schemaBuilder.option(CoreOptions.VECTOR_FILE_FORMAT.key(), "json");
+        schemaBuilder.option(CoreOptions.ROW_TRACKING_ENABLED.key(), "true");
+        schemaBuilder.option(CoreOptions.DATA_EVOLUTION_ENABLED.key(), "true");
+        catalog.createTable(identifier(), schemaBuilder.build(), true);
+
+        FileStoreTable table = getTableDefault();
+
+        int numBatches = 5;
+        int rowsPerBatch = 3;
+        Map<Integer, float[]> expected = new HashMap<>();
+        List<CommitMessage> messages = new ArrayList<>();
+        int id = 0;
+        for (int b = 0; b < numBatches; b++) {
+            StreamWriteBuilder builder = table.newStreamWriteBuilder();
+            builder.withCommitUser(commitUser);
+            try (StreamTableWrite write = builder.newWrite()) {
+                for (int r = 0; r < rowsPerBatch; r++) {
+                    float[] vector = randomFixedLengthVector(vectorLength);
+                    expected.put(id, vector);
+                    write.write(
+                            GenericRow.of(
+                                    id,
+                                    BinaryString.fromString("row-" + id),
+                                    BinaryVector.fromPrimitiveArray(vector)));
+                    id++;
+                }
+                messages.addAll(write.prepareCommit(false, Long.MAX_VALUE));
+            }
+        }
+        commitDefault(messages);
+
+        DataEvolutionCompactCoordinator coordinator =
+                new DataEvolutionCompactCoordinator(table, false, true);
+        List<DataEvolutionCompactTask> tasks = coordinator.plan();
+        assertThat(tasks.stream().anyMatch(DataEvolutionCompactTask::isVectorTask)).isTrue();
+
+        List<CommitMessage> compactMessages = new ArrayList<>();
+        for (DataEvolutionCompactTask task : tasks) {
+            compactMessages.add(task.doCompact(table, commitUser));
+        }
+        commitDefault(compactMessages);
+
+        Map<Integer, float[]> actual = new HashMap<>();
+        readDefault(row -> actual.put(row.getInt(0), row.getVector(2).toFloatArray()));
+
+        assertThat(actual.size()).isEqualTo(expected.size());
+        for (Map.Entry<Integer, float[]> entry : expected.entrySet()) {
+            Assertions.assertArrayEquals(entry.getValue(), actual.get(entry.getKey()), 0);
+        }
+    }
+
+    private float[] randomFixedLengthVector(int length) {
+        float[] vector = new float[length];
+        for (int i = 0; i < length; i++) {
+            vector[i] = RANDOM.nextFloat();
+        }
+        return vector;
     }
 
     @Override

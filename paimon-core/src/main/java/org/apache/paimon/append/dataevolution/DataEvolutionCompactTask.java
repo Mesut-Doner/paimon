@@ -24,6 +24,7 @@ import org.apache.paimon.append.AppendCompactTask;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fileindex.FileIndexOptions;
+import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.blob.BlobFileFormat;
 import org.apache.paimon.io.CompactIncrement;
 import org.apache.paimon.io.DataFileMeta;
@@ -48,6 +49,7 @@ import org.apache.paimon.utils.LongCounter;
 import org.apache.paimon.utils.Range;
 import org.apache.paimon.utils.RecordWriter;
 import org.apache.paimon.utils.SetUtils;
+import org.apache.paimon.utils.StatsCollectorFactories;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,7 +66,6 @@ import java.util.stream.Collectors;
 import static java.util.Comparator.comparingLong;
 import static org.apache.paimon.types.BlobType.fieldNamesInBlobFile;
 import static org.apache.paimon.types.VectorType.fieldNamesInVectorFile;
-import static org.apache.paimon.types.VectorType.isVectorStoreFile;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /** Data evolution table compaction task. */
@@ -83,16 +84,30 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
         return Collections.unmodifiableMap(options);
     }
 
-    private final boolean blobTask;
+    /** The kind of files this task compacts. */
+    public enum TaskKind {
+        NORMAL,
+        BLOB,
+        VECTOR
+    }
 
-    public DataEvolutionCompactTask(
-            BinaryRow partition, List<DataFileMeta> files, boolean blobTask) {
+    private final TaskKind kind;
+
+    public DataEvolutionCompactTask(BinaryRow partition, List<DataFileMeta> files, TaskKind kind) {
         super(partition, files);
-        this.blobTask = blobTask;
+        this.kind = kind;
+    }
+
+    public TaskKind kind() {
+        return kind;
     }
 
     public boolean isBlobTask() {
-        return blobTask;
+        return kind == TaskKind.BLOB;
+    }
+
+    public boolean isVectorTask() {
+        return kind == TaskKind.VECTOR;
     }
 
     public CommitMessage doCompact(FileStoreTable table, String commitUser) throws Exception {
@@ -101,14 +116,19 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
                 !options.deletionVectorsEnabled(),
                 "Data evolution compaction does not support deletion vectors.");
 
-        if (blobTask) {
-            return doCompactBlobFiles(table, commitUser);
+        switch (kind) {
+            case BLOB:
+                return doCompactBlobFiles(table, commitUser);
+            case VECTOR:
+                return doCompactVectorStoreFiles(table, commitUser);
+            default:
+                return doCompactNormalFiles(table, commitUser);
         }
-        if (isVectorStoreFile(compactBefore.get(0).fileName())) {
-            // TODO: support vector-store file compaction
-            throw new UnsupportedOperationException("Vector-store task is not supported");
-        }
+    }
 
+    private CommitMessage doCompactNormalFiles(FileStoreTable table, String commitUser)
+            throws Exception {
+        CoreOptions options = table.coreOptions();
         Set<String> fieldsInDedicatedFile =
                 SetUtils.union(
                         fieldNamesInBlobFile(table.rowType(), options.blobInlineField()),
@@ -283,6 +303,151 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
                 Collections.singletonList(blobFieldName));
     }
 
+    private CommitMessage doCompactVectorStoreFiles(FileStoreTable table, String commitUser)
+            throws Exception {
+        CoreOptions options = table.coreOptions();
+        List<DataFileMeta> sortedCompactBefore = sortedByFirstRowId(compactBefore);
+        RowType vectorWriteType = vectorWriteType(table, options, sortedCompactBefore);
+        Range compactBeforeRange = checkContiguousRowRange(sortedCompactBefore);
+        checkArgument(
+                sortedCompactBefore.size() > 1,
+                "Vector-store compaction task %s should contain at least two files to compact.",
+                this);
+
+        AppendOnlyFileStore store = (AppendOnlyFileStore) table.store();
+        DataFilePathFactory pathFactory =
+                store.pathFactory().createDataFilePathFactory(partition, 0);
+
+        DataSplit dataSplit =
+                DataSplit.builder()
+                        .withPartition(partition)
+                        .withBucket(0)
+                        .withDataFiles(sortedCompactBefore)
+                        .withBucketPath(pathFactory.parent().toString())
+                        .rawConvertible(false)
+                        .build();
+        RecordReader<InternalRow> reader =
+                store.newDataEvolutionRead().withReadType(vectorWriteType).createReader(dataSplit);
+        FileWriter<InternalRow, DataFileMeta> writer =
+                createVectorStoreFileWriter(table, options, vectorWriteType, pathFactory);
+
+        try {
+            reader.forEachRemaining(
+                    row -> {
+                        try {
+                            writer.write(row);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+            writer.close();
+        } catch (Exception e) {
+            writer.abort();
+            throw e;
+        }
+
+        long minSequenceId = minSequenceId(sortedCompactBefore);
+        long maxSequenceId = maxSequenceId(sortedCompactBefore);
+        DataFileMeta compactedFile =
+                writer.result()
+                        .assignFirstRowId(compactBeforeRange.from)
+                        .assignSequenceNumber(minSequenceId, maxSequenceId);
+        compactAfter.add(compactedFile);
+        checkArgument(
+                compactAfter.size() == 1, "Vector-store file compaction should produce one file.");
+        checkSameRowRange(sortedCompactBefore, compactAfter);
+
+        CompactIncrement compactIncrement =
+                new CompactIncrement(
+                        sortedCompactBefore,
+                        compactAfter,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        Collections.emptyList());
+        return new CommitMessageImpl(
+                partition, 0, null, DataIncrement.emptyIncrement(), compactIncrement);
+    }
+
+    private FileWriter<InternalRow, DataFileMeta> createVectorStoreFileWriter(
+            FileStoreTable table,
+            CoreOptions options,
+            RowType vectorWriteType,
+            DataFilePathFactory pathFactory) {
+        FileFormat vectorFileFormat = FileFormat.vectorFileFormat(options);
+        checkArgument(
+                vectorFileFormat != null,
+                "Cannot compact vector-store files without a configured vector file format.");
+        List<String> vectorFieldNames = vectorWriteType.getFieldNames();
+        SimpleColStatsCollector.Factory[] statsCollectors =
+                new StatsCollectorFactories(options).statsCollectors(vectorFieldNames);
+        return new RowDataFileWriter(
+                table.fileIO(),
+                RollingFileWriter.createFileWriterContext(
+                        vectorFileFormat,
+                        vectorWriteType,
+                        statsCollectors,
+                        options.fileCompression()),
+                pathFactory.newVectorPath(vectorFileFormat.getFormatIdentifier()),
+                vectorWriteType,
+                table.schema().id(),
+                () -> new LongCounter(0),
+                new FileIndexOptions(),
+                FileSource.COMPACT,
+                false,
+                options.statsDenseStore(),
+                pathFactory.isExternalPath(),
+                vectorFieldNames);
+    }
+
+    private RowType vectorWriteType(
+            FileStoreTable table, CoreOptions options, List<DataFileMeta> files) {
+        Set<Integer> vectorFieldIds = null;
+        Map<Long, RowType> schemaCache = new HashMap<>();
+        for (DataFileMeta file : files) {
+            checkArgument(
+                    file.writeCols() != null && !file.writeCols().isEmpty(),
+                    "Vector-store file %s should contain at least one write column.",
+                    file);
+            RowType fileRowType =
+                    schemaCache.computeIfAbsent(
+                            file.schemaId(),
+                            schemaId -> table.schemaManager().schema(schemaId).logicalRowType());
+            Set<Integer> currentFieldIds =
+                    file.writeCols().stream()
+                            .map(name -> fileRowType.getField(name).id())
+                            .collect(Collectors.toSet());
+            if (vectorFieldIds == null) {
+                vectorFieldIds = currentFieldIds;
+            } else {
+                checkArgument(
+                        vectorFieldIds.equals(currentFieldIds),
+                        "Vector-store compact before files %s should contain the same fields.",
+                        files);
+            }
+        }
+
+        checkArgument(vectorFieldIds != null, "Vector-store compaction task should not be empty.");
+        Set<Integer> fieldIds = vectorFieldIds;
+        List<DataField> fields =
+                table.rowType().getFields().stream()
+                        .filter(f -> fieldIds.contains(f.id()))
+                        .collect(Collectors.toList());
+        checkArgument(
+                fields.size() == fieldIds.size(),
+                "Cannot find all vector-store field ids %s in latest schema for compaction task %s.",
+                fieldIds,
+                this);
+        Set<String> vectorFieldNames =
+                fieldNamesInVectorFile(table.rowType(), options.withVectorFormat());
+        for (DataField field : fields) {
+            checkArgument(
+                    vectorFieldNames.contains(field.name()),
+                    "Field %s in latest schema is not a vector-store file field.",
+                    field.name());
+        }
+        return new RowType(fields);
+    }
+
     private List<DataFileMeta> sortedByFirstRowId(List<DataFileMeta> files) {
         List<DataFileMeta> sorted = new ArrayList<>(files);
         sorted.sort(comparingLong(DataFileMeta::nonNullFirstRowId));
@@ -377,7 +542,7 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
 
     @Override
     public int hashCode() {
-        return Objects.hash(partition, compactBefore, compactAfter, blobTask);
+        return Objects.hash(partition, compactBefore, compactAfter, kind);
     }
 
     @Override
@@ -390,7 +555,7 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
         }
 
         DataEvolutionCompactTask that = (DataEvolutionCompactTask) o;
-        return blobTask == that.blobTask
+        return kind == that.kind
                 && Objects.equals(partition, that.partition)
                 && Objects.equals(compactBefore, that.compactBefore)
                 && Objects.equals(compactAfter, that.compactAfter);
@@ -403,7 +568,7 @@ public class DataEvolutionCompactTask extends AppendCompactTask {
                         + "partition = %s, "
                         + "compactBefore = %s, "
                         + "compactAfter = %s, "
-                        + "blobTask = %s}",
-                partition, compactBefore, compactAfter, blobTask);
+                        + "kind = %s}",
+                partition, compactBefore, compactAfter, kind);
     }
 }
